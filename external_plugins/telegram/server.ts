@@ -19,9 +19,55 @@ import { z } from 'zod'
 import { Bot, GrammyError, InlineKeyboard, InputFile, type Context } from 'grammy'
 import type { ReactionTypeEmoji } from 'grammy/types'
 import { randomBytes } from 'crypto'
-import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync } from 'fs'
+import { readFileSync, writeFileSync, mkdirSync, appendFileSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync } from 'fs'
 import { homedir } from 'os'
 import { join, extname, sep } from 'path'
+
+// Mirror every stderr write into a per-pid log file for crash diagnostics.
+// Installed early so we capture token/env errors and stale-poller messages.
+;(() => {
+  const dir = join(process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram'), 'logs')
+  try { mkdirSync(dir, { recursive: true }) } catch {}
+  const pad = (n: number, w = 2) => String(n).padStart(w, '0')
+  // Local-time timestamp with explicit offset so the log is unambiguous.
+  // Format: 2026-05-08 16:44:23.794+03:00
+  const ts = () => {
+    const d = new Date()
+    const off = -d.getTimezoneOffset()
+    const sign = off >= 0 ? '+' : '-'
+    const oh = pad(Math.floor(Math.abs(off) / 60))
+    const om = pad(Math.abs(off) % 60)
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ` +
+      `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.${pad(d.getMilliseconds(), 3)}${sign}${oh}:${om}`
+  }
+  // Filename prefix: telegram_bot_yyyy_mm_dd__hh_mm_<pid>.log (start time, local).
+  const start = new Date()
+  const fileStem = `telegram_bot_${start.getFullYear()}_${pad(start.getMonth() + 1)}_${pad(start.getDate())}__${pad(start.getHours())}_${pad(start.getMinutes())}_${process.pid}`
+  const file = join(dir, `${fileStem}.log`)
+  const orig = process.stderr.write.bind(process.stderr)
+  ;(process.stderr as any).write = (chunk: any, ...rest: any[]) => {
+    try {
+      const text = typeof chunk === 'string' ? chunk : chunk.toString()
+      appendFileSync(file, `[${ts()}] ${text}`)
+    } catch {}
+    return (orig as any)(chunk, ...rest)
+  }
+  process.on('exit', code => {
+    try { appendFileSync(file, `[${ts()}] telegram channel: process exit code=${code}\n`) } catch {}
+  })
+  for (const sig of ['SIGTERM', 'SIGINT', 'SIGHUP', 'SIGBREAK'] as const) {
+    try { process.on(sig as any, () => { try { appendFileSync(file, `[${ts()}] telegram channel: received ${sig}\n`) } catch {} }) } catch {}
+  }
+  // Heartbeat — last entry before death tells us when the process was last alive.
+  setInterval(() => {
+    try { appendFileSync(file, `[${ts()}] heartbeat\n`) } catch {}
+  }, 2000).unref()
+  // stdin events — if the MCP host closes its end, this fires before shutdown.
+  try { process.stdin.on('end', () => { try { appendFileSync(file, `[${ts()}] stdin: end\n`) } catch {} }) } catch {}
+  try { process.stdin.on('close', () => { try { appendFileSync(file, `[${ts()}] stdin: close\n`) } catch {} }) } catch {}
+  try { process.stdin.on('error', e => { try { appendFileSync(file, `[${ts()}] stdin: error: ${e}\n`) } catch {} }) } catch {}
+  process.stderr.write(`telegram channel: log started, pid=${process.pid}, file=${file}\n`)
+})()
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
