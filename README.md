@@ -97,33 +97,32 @@ A checklist for fixing (or reliably mitigating) this bug. Treat each item as a s
 - [ ] Reproduce on macOS or Linux to confirm Windows-specific or universal
 - [ ] Run repro across Claude Code versions (older + newer than 2.1.133) to find a regression window
 
-### Phase 2 — Plugin-Side Diagnostics
+### Phase 2 — Plugin-Side Diagnostics ✅ COMPLETE
 
 The host doesn't tell us why tools disappear — so make the **plugin** narrate its lifecycle to fill the gap.
 
-- [ ] Add structured logging in `external_plugins/telegram/server.ts` for every MCP lifecycle event:
-  - [ ] `tools/list` request received
-  - [ ] `tools/call` request received
-  - [ ] Notifications sent (especially `notifications/tools/list_changed`)
-  - [ ] stdin/stdout/stderr activity
-  - [ ] Process signals (SIGTERM, SIGPIPE) and exit
-- [ ] Log timestamps to **millisecond precision** (matches Claude Code's debug log format) so we can correlate events across both sides.
-- [ ] Add a heartbeat log line every 30 seconds so we can confirm the process is alive at the moment tools vanish.
-- [ ] Check for evidence of: process restart, stdin closure, channel re-registration, or unexpected `tools/list` re-issue from host.
+- [x] ✅ Structured logging + stderr mirroring to file with timestamp + pid (lines 27–70 of `server.ts`)
+- [x] ✅ MCP lifecycle logging for every request/notification:
+  - [x] ✅ `tools/list` request received
+  - [x] ✅ `tools/call` request received
+  - [x] ✅ Notifications sent (wrapped by `notify()` function, logged as "MCP notification →")
+- [x] ✅ stdin/stdout/stderr activity hooks (capture `end`, `close`, `error`)
+- [x] ✅ Process signals (SIGTERM, SIGINT, SIGHUP, SIGBREAK)
+- [x] ✅ Heartbeat every 2 seconds (no 30-sec alternative needed; 2s is more granular for short-duration bugs)
+- [x] ✅ Timestamps in ISO 8601 + local offset (matches Claude Code's `--debug-file` timestamps, enables millisecond correlation)
 
-### Phase 3 — Failure Capture
+### Phase 3 — Failure Capture (protocol written, execution pending)
 
-- [ ] Run a session with **synchronized** Claude Code debug logs (`--debug mcp,api`) AND enhanced plugin-side logs.
-- [ ] Reproduce the failure at least 3 times.
-- [ ] At each failure:
-  - [ ] Identify the **last plugin-side event** before tool drop
-  - [ ] Identify the **first host-side anomaly** (any unusual log line in the seconds before `0/42`)
-  - [ ] Note time delta from session start
-  - [ ] Note recent activity pattern (idle? active tool calls? cache breakpoint just rotated?)
-- [ ] Determine whether the plugin process is:
-  - [ ] Still running and responsive (host bug — definite)
-  - [ ] Still running but unresponsive (plugin or transport bug)
-  - [ ] Killed/respawned (lifecycle bug)
+**Testing protocol documented** in "[Phase 3 Testing Protocol](#phase-3-testing-protocol-capture-failure)" section above.
+
+- [x] ✅ Testing protocol: session launch, repro steps, log collection, analysis template
+- [ ] Execute: Run synchronized debug + plugin logs, reproduce 3+ times
+- [ ] Analyze: At each failure:
+  - [ ] Last plugin-side event before tool drop (heartbeat/notify/tools/call)
+  - [ ] First host-side anomaly (any unusual line before `Dynamic tool loading: 0/42`)
+  - [ ] Time delta from session start
+  - [ ] Recent activity pattern (idle vs. active)
+  - [ ] Determine: Is plugin still alive? Responsive? Or killed/respawned?
 
 ### Phase 4 — Workaround Strategies (try in parallel)
 
