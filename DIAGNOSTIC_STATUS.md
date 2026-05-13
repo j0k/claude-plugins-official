@@ -1,117 +1,120 @@
 # Issue #57372 Diagnostic Status
 
 **Last Updated:** 2026-05-12
-**Status:** Diagnostic framework complete. Ready for Phase 3 execution.
+**Status:** 🚀 **Architectural bypass shipped (v0.1.0)**. Original diagnostics also intact for upstream evidence.
 
-## What's Done
+## v0.1.0 — Decoupled Daemon Architecture
+
+The Telegram plugin has been rewritten as a **two-process design** that bypasses issue #57372 entirely:
+
+1. **`daemon.ts`** — independent bot process (autostart via Task Scheduler), holds Telegram token, owns long-poll connection, writes inbox/outbox queue files, serves web UI on localhost:9999.
+2. **`server.ts`** — MCP plugin **without** `claude/channel` capability. Pure tools, architecturally identical to playwright. Reads inbox queue, writes outbox queue.
+
+The MCP plugin is immune to the bug because it never enters the host's `claude/channel` code path.
+
+### Plugin tools (replaces old reply/react/edit_message/download_attachment)
+- `send_message(chat_id, text, files, reply_to, format, wait)` — queue outbound
+- `react(chat_id, message_id, emoji)` — queue reaction
+- `edit_message(chat_id, message_id, text, format)` — queue edit
+- `read_inbox(limit, chat_id)` — drain pending messages, update last_read
+- `peek_inbox()` — count without draining
+- `wait_for_message(timeout_sec, chat_id)` — long-poll-style block
+- `daemon_status()` — check heartbeat age + pid
+- `start_daemon(web_port)` — spawn daemon if not running
+- `download_attachment(file_id)` — fetch non-photo attachment inline
+
+### Wakeup modes
+| Mode | How | When |
+|---|---|---|
+| Manual | `read_inbox` | "Check telegram" — one-off |
+| Active watch | `wait_for_message` in loop | "Watch the chat" — focused session |
+| Scheduled | `/loop 30s /check-telegram` | Background pseudo-push |
+
+Plus 15s `notifications/tools/list_changed` ping-pong for belt-and-suspenders.
+
+## Debug Interfaces (new in v0.1.0)
+
+| Interface | Where | Use |
+|---|---|---|
+| **Web UI** | http://127.0.0.1:9999 | Live dashboard: inbox/outbox panels, events stream |
+| **Telegram bot** | `/queue` `/daemon` `/web` | In-chat status from paired users |
+| **events.jsonl** | `~/.claude/channels/telegram/events.jsonl` | Structured grep-friendly event log |
+| **`telegram-tail.ps1`** | `external_plugins/telegram/scripts/` | Unified colored live tail with filters |
+| **Per-pid logs** | `~/.claude/channels/telegram/logs/{daemon,plugin}/*.log` | Plaintext stderr mirror |
+
+## PowerShell Tooling (new in v0.1.0)
+
+In `external_plugins/telegram/scripts/`:
+- `start-daemon.ps1` — manual start (detached or foreground)
+- `stop-daemon.ps1` — graceful stop with taskkill fallback
+- `status-daemon.ps1` — pid, uptime, heartbeat age, queue counts
+- `install-daemon.ps1` — register in Task Scheduler (auto-start at login)
+- `uninstall-daemon.ps1` — remove from Task Scheduler
+- `telegram-tail.ps1` — unified colored tail with `-ErrorsOnly` / `-Grep` / `-EventsOnly`
+
+## Roadmap (Updated)
 
 ### Phase 1: Information Gathering ✅
-- [x] Reproduced the bug (tool deregistration at ~5min)
-- [x] Captured multiple debug traces
-- [x] Identified `claude/channel` differential (playwright unaffected)
-- [x] Filed upstream issue #57372
+- Reproduced bug, captured traces, identified playwright differential, filed #57372
 
 ### Phase 2: Plugin-Side Diagnostics ✅
-**File:** `external_plugins/telegram/server.ts`
+- Stderr mirroring, heartbeat, MCP lifecycle logging, signal hooks
 
-- [x] **Stderr mirroring** → per-pid log files with ISO 8601 timestamps (lines 27–70)
-- [x] **Heartbeat** → every 2s for liveness confirmation
-- [x] **MCP logging** → `notify()` wrapper logs all request/notification boundaries
-- [x] **Process lifecycle** → signals (SIGTERM/INT/HUP/BREAK), exit code, stdin closure
-- [x] **Timestamps** → millisecond precision for correlation with `--debug-file` logs
+### Phase 3: Failure Capture (still useful for upstream)
+- Testing protocol documented in repo README
+- Synchronized debug + plugin logs reveal failure correlation
 
-**Log location:** `~/.claude/channels/telegram/logs/telegram_bot_YYYY_MM_DD__HH_MM_<pid>.log`
+### Phase 4: Workarounds
+- [x] **A.** Periodic re-registration ping (every 4 min) — _superseded by Phase 6_
+- [x] **B.** Now integrated as 15s ping-pong in v0.1.0
+- [x] **C.** ~Watchdog wrapper~ — _superseded by independent daemon in v0.1.0_
+- [x] **D.** `/queue` `/daemon` Telegram commands shipped
 
-### Phase 4A: Workaround ✅
-- [x] **Periodic re-registration ping** → emits `notifications/tools/list_changed` every 4 min
-  - Logged as `re-registration ping (issue #57372 workaround)`
-  - Hypothesis: forces tool refresh before cache TTL rotation drops them
-  - Risk: low — harmless if hypothesis is wrong
+### Phase 5: Upstream Fix Path
+- [ ] Monitor #57372 for maintainer response
+- [ ] Supply repro data + suggest claude/channel lifecycle fix
+- [ ] When upstream fixes land, decide: keep daemon architecture (more robust) or revert (simpler)
 
-## What's Next
+### Phase 6: Architectural Bypass ✅ (v0.1.0)
+- [x] Decoupled daemon process design
+- [x] File-based queue protocol with atomic writes
+- [x] Pure-tools MCP plugin (no claude/channel)
+- [x] Web UI + Telegram dashboard + JSONL events + unified tail
+- [x] PowerShell install/manage scripts
 
-### Phase 3: Failure Capture 🔄 (Ready to Execute)
-**Location:** README > "Phase 3 Testing Protocol"
+## What v0.1.0 Tradeoffs
 
-**What to do:**
-1. Launch Claude Code with Telegram plugin + debug logging:
-   ```powershell
-   $debugLog = "$env:USERPROFILE\.claude\claude_debug_phase3_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
-   claude --channels plugin:telegram@claude-plugins-official `
-          --dangerously-skip-permissions `
-          --debug "mcp,api" `
-          --debug-file $debugLog
-   ```
+**Lost (vs. v0.0.6):**
+- ❌ Automatic wakeup on message — Claude must poll
+- ❌ Permission relay via Telegram inline buttons (no `claude/channel/permission`)
 
-2. Follow the 5-step repro protocol:
-   - Establish baseline (verify bot works, see `Dynamic tool loading: 1/46`)
-   - Wait passively 3–4 min (send periodic Telegram messages)
-   - Hit tool call at ~5 min mark (force `reply` or `react` tool)
-   - Capture the `Tool not found` error
-   - Collect logs (`claude_debug.log` + `telegram_bot_*.log` from `~/.claude/channels/telegram/logs/`)
-
-3. Analyze the synchronized logs:
-   - What's the **last plugin line** before tool drop?
-   - What's the **first host anomaly** near `Dynamic tool loading: 0/42`?
-   - How many seconds of silence in the plugin log?
-   - Is `Channel notifications registered` seen twice?
-
-4. Fill in the analysis table (in README, Phase 3 section)
-
-5. Repeat 2–3 times to identify patterns
-
-**Success criteria:**
-- Tool drop at 4–5 min or later
-- `Dynamic tool loading: 1/46 → 0/42` in host log
-- Plugin logs with heartbeats + lifecycle events
-- Correlatable timestamps across both logs
-
-**Expected outcome:** Enough data to validate or eliminate each hypothesis.
-
-### Phase 4: Workarounds (remaining)
-- [ ] **B.** Reverse heartbeat (keep stdio pipe warm)
-- [ ] **C.** Watchdog wrapper (auto-respawn if >5 min idle)
-- [ ] **D.** `/telegram-reload` command (user-triggered workaround)
-
-Currently only **4A (periodic re-registration)** is implemented.
-
-### Phase 5: Upstream
-- [ ] Monitor [#57372](https://github.com/anthropics/claude-code/issues/57372)
-- [ ] Supply repro data from Phase 3 if requested
-- [ ] Validate upstream fix covers all hypotheses
-
-## Current Hypotheses (Ranked)
-
-1. **Cache rotation** — Prompt cache TTL (~5 min) rotates, dropping tool definitions from cached prefix. Host fails to re-register for `claude/channel` servers.
-2. **Channel-specific watchdog** — Host runs separate lifecycle for channel servers, disabled on timer.
-3. **Periodic cleanup** — Scheduled task walks channel servers, incorrectly removes their tools.
-4. **Registration race** — Double re-registration at startup overwrites instead of merges, leaving registry blank.
-
-**Differential:** `playwright` MCP server (same session, same stdio, NO `claude/channel`) is unaffected for 1+ hour. Bug is scoped to channel-capable servers.
+**Gained:**
+- ✅ Immunity to issue #57372 (architectural)
+- ✅ Messages persist if Claude is offline (queue on disk)
+- ✅ Daemon survives Claude restarts and `/reload-plugins`
+- ✅ Independent debug surfaces (web UI, JSONL, dashboards)
+- ✅ Concurrent inspection: see inbox/outbox as files
 
 ## Files
 
 | File | Purpose |
 |---|---|
-| `external_plugins/telegram/server.ts` | Enhanced with logging + 4A workaround |
-| `external_plugins/telegram/server.ts.original-pre-logging` | Pristine v0.0.6 baseline (for diffs) |
-| `README.md` | Full documentation (hypotheses, roadmap, tactics, protocol) |
-| `DIAGNOSTIC_STATUS.md` | This file — quick reference |
+| `external_plugins/telegram/daemon.ts` | Independent Telegram bot daemon |
+| `external_plugins/telegram/server.ts` | MCP plugin (pure tools) |
+| `external_plugins/telegram/shared.ts` | Queue protocol + utilities |
+| `external_plugins/telegram/web-ui-html.ts` | Embedded localhost dashboard |
+| `external_plugins/telegram/scripts/*.ps1` | Daemon management + tail tools |
+| `external_plugins/telegram/README.md` | User-facing plugin docs |
+| `README.md` | Repo overview, bug context, bypass intro |
+| `DIAGNOSTIC_STATUS.md` | This file |
 
 ## Quick Links
 
 - **Upstream issue:** https://github.com/anthropics/claude-code/issues/57372
-- **Testing protocol:** README > "Phase 3 Testing Protocol"
-- **Plugin logs:** `~/.claude/channels/telegram/logs/`
-- **Host logs:** Pass `--debug-file <path>` to capture
-
-## Notes
-
-- The fork is **snapshot-only** — not intended for production use. It's an experimental debugging tool.
-- Phase 4A (periodic ping) is safe to use in production, but doesn't fix the root issue.
-- Once upstream fix lands, remove plugin-side workarounds (Phase 5).
-- Windows-only testing so far; unknown if bug affects macOS/Linux.
+- **New plugin docs:** `external_plugins/telegram/README.md`
+- **Web UI:** http://127.0.0.1:9999 (when daemon is running)
+- **State dir:** `~/.claude/channels/telegram/`
 
 ---
 
-**Next action:** Run Phase 3 protocol, capture logs, fill analysis table.
+**Next action:** Field-test the new architecture end-to-end. Configure token, start daemon, pair user, exercise all wakeup modes. Capture any new failure modes in events.jsonl.

@@ -1,8 +1,10 @@
 # Telegram Plugin Debugging Fork
 
 > **🐛 Debugging fork for [Issue #57372](https://github.com/anthropics/claude-code/issues/57372): MCP tool deregistration in the Telegram plugin.**
+>
+> **🚀 v0.1.0 — Now ships with a complete architectural bypass.** The `external_plugins/telegram` plugin has been rebuilt as a **decoupled daemon + pure-tools MCP** design. The new plugin does NOT declare `claude/channel`, so it sidesteps the buggy host code path entirely. See [`external_plugins/telegram/README.md`](external_plugins/telegram/README.md) for the new architecture.
 
-This fork exists to investigate, reproduce, and (eventually) work around or patch a bug where the Telegram plugin's MCP tools silently disappear from Claude Code's registry mid-session. The repo contains a snapshot of the working `external_plugins/telegram` (v0.0.6) for offline experimentation.
+This fork exists to investigate, reproduce, and (eventually) work around or patch a bug where the Telegram plugin's MCP tools silently disappear from Claude Code's registry mid-session.
 
 ---
 
@@ -10,8 +12,45 @@ This fork exists to investigate, reproduce, and (eventually) work around or patc
 
 - **What breaks:** The four Telegram MCP tools (`reply`, `react`, `edit_message`, `download_attachment`) vanish from Claude Code's tool registry after 2–5 minutes (sometimes longer in low-activity sessions).
 - **What recovers it:** Running `/reload-plugins` re-registers the tools.
-- **Why it's hard to debug:** Claude Code's `--debug mcp` logs show *that* the tools were removed (`Dynamic tool loading: 0/42` was `1/46`), but contain **no lifecycle events explaining why** — no deregistration trigger, no plugin disconnect, no cache rotation marker. The fix has to start with diagnostic instrumentation.
+- **Why it's hard to debug:** Claude Code's `--debug mcp` logs show *that* the tools were removed (`Dynamic tool loading: 0/42` was `1/46`), but contain **no lifecycle events explaining why** — no deregistration trigger, no plugin disconnect, no cache rotation marker.
 - **Differential clue:** The `playwright` MCP server (also stdio, but **without** `claude/channel` capability) in the **same session** is unaffected for hours. This narrows the bug to **`claude/channel`-capable stdio MCP servers**.
+- **The bypass:** v0.1.0 makes the Telegram plugin look like `playwright` — no `claude/channel`, pure tools, file-based queue to a separate daemon process. Immune by construction.
+
+## The bypass — what v0.1.0 changes
+
+**Old (v0.0.6):** Single process, `claude/channel` capability, push notifications → tools disappear at ~5min.
+
+**New (v0.1.0):** Two processes communicating via file queue:
+
+```
+Telegram API ←long-poll→ daemon process (independent, autostart at login)
+                            ↓
+                       queue/inbox/  queue/outbox/  events.jsonl
+                            ↑
+                       MCP plugin (pure tools, no claude/channel) ←stdio→ Claude Code
+```
+
+The MCP plugin is architecturally identical to `playwright`:
+- No `claude/channel` capability
+- No server→client push notifications
+- Only standard tools: `send_message`, `read_inbox`, `wait_for_message`, `daemon_status`, etc.
+
+Three wakeup modes for Claude:
+- **Manual** — "check telegram" → `read_inbox`
+- **Active watch** — `wait_for_message(60)` in a loop
+- **Scheduled** — `/loop 30s /check-telegram`
+
+Plus a 15-second ping-pong (`notifications/tools/list_changed`) as a belt-and-suspenders workaround.
+
+## Debug interfaces
+
+- **Web UI** on `http://127.0.0.1:9999` — live inbox/outbox/events dashboard
+- **Telegram `/menu` commands** — `/queue`, `/daemon`, `/web` from the bot
+- **`events.jsonl`** — structured event log (grep-friendly, ms-precision timestamps)
+- **`telegram-tail.ps1`** — unified colored live tail with filters (`-ErrorsOnly`, `-Grep`)
+- **Per-pid plaintext logs** — `~/.claude/channels/telegram/logs/{daemon,plugin}/`
+
+See [`external_plugins/telegram/README.md`](external_plugins/telegram/README.md) for full details.
 
 ---
 
