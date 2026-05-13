@@ -211,16 +211,17 @@ A self-invoking IIFE at the top of `server.ts` (lines **26–70**) installs all 
 | [`server.ts:69`](external_plugins/telegram/server.ts#L69) | First log line: `telegram channel: log started, pid=<pid>, file=<path>` |
 
 **What gets logged (because stderr is mirrored):**
-- All `process.stderr.write(...)` calls anywhere in the codebase
-- Crash stack traces (Node writes uncaught exceptions to stderr by default)
-- Token/env errors at boot ([`server.ts:91–98`](external_plugins/telegram/server.ts#L91-L98))
-- Heartbeats every 2s
-- Process lifecycle events (signals, exit, stdin closure)
+- ✅ **Inbound Telegram messages** — user, chat ID, message preview (first 80 chars), dropped/delivered status
+- ✅ **MCP protocol traffic** — `tools/list` requests, `tools/call` requests, notification emissions
+- ✅ All `process.stderr.write(...)` calls anywhere in the codebase
+- ✅ Crash stack traces
+- ✅ Token/env errors at boot
+- ✅ Heartbeats every 2s
+- ✅ Process lifecycle events (signals, exit, stdin closure)
 
-**What does NOT get logged (gap to fill in Phase 2):**
-- ❌ MCP protocol traffic (`tools/list`, `tools/call` requests) — these go through stdin/stdout, not stderr
-- ❌ `notifications/tools/list_changed` emissions
-- ❌ Per-handler entry/exit traces
+**Logging coverage:**
+- ✅ Inbound message activity (for Phase 3: "was session idle or active before failure?")
+- ✅ MCP protocol lifecycle (request entry/exit logged via `notify()` wrapper)
 
 To make Phase 2 work, **add explicit logging at every MCP protocol boundary** — wherever the SDK's request handlers are registered. Search `server.ts` for `server.setRequestHandler` or similar SDK calls and instrument them.
 
