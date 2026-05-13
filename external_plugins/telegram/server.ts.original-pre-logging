@@ -16,59 +16,12 @@ import {
   CallToolRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js'
 import { z } from 'zod'
-import { Bot, GrammyError, InlineKeyboard, InputFile, Keyboard, type Context } from 'grammy'
-import { execFileSync, spawn } from 'child_process'
+import { Bot, GrammyError, InlineKeyboard, InputFile, type Context } from 'grammy'
 import type { ReactionTypeEmoji } from 'grammy/types'
 import { randomBytes } from 'crypto'
-import { readFileSync, writeFileSync, mkdirSync, appendFileSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync } from 'fs'
+import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync } from 'fs'
 import { homedir } from 'os'
 import { join, extname, sep } from 'path'
-
-// Mirror every stderr write into a per-pid log file for crash diagnostics.
-// Installed early so we capture token/env errors and stale-poller messages.
-;(() => {
-  const dir = join(process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram'), 'logs')
-  try { mkdirSync(dir, { recursive: true }) } catch {}
-  const pad = (n: number, w = 2) => String(n).padStart(w, '0')
-  // Local-time timestamp with explicit offset so the log is unambiguous.
-  // Format: 2026-05-08 16:44:23.794+03:00
-  const ts = () => {
-    const d = new Date()
-    const off = -d.getTimezoneOffset()
-    const sign = off >= 0 ? '+' : '-'
-    const oh = pad(Math.floor(Math.abs(off) / 60))
-    const om = pad(Math.abs(off) % 60)
-    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ` +
-      `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.${pad(d.getMilliseconds(), 3)}${sign}${oh}:${om}`
-  }
-  // Filename prefix: telegram_bot_yyyy_mm_dd__hh_mm_<pid>.log (start time, local).
-  const start = new Date()
-  const fileStem = `telegram_bot_${start.getFullYear()}_${pad(start.getMonth() + 1)}_${pad(start.getDate())}__${pad(start.getHours())}_${pad(start.getMinutes())}_${process.pid}`
-  const file = join(dir, `${fileStem}.log`)
-  const orig = process.stderr.write.bind(process.stderr)
-  ;(process.stderr as any).write = (chunk: any, ...rest: any[]) => {
-    try {
-      const text = typeof chunk === 'string' ? chunk : chunk.toString()
-      appendFileSync(file, `[${ts()}] ${text}`)
-    } catch {}
-    return (orig as any)(chunk, ...rest)
-  }
-  process.on('exit', code => {
-    try { appendFileSync(file, `[${ts()}] telegram channel: process exit code=${code}\n`) } catch {}
-  })
-  for (const sig of ['SIGTERM', 'SIGINT', 'SIGHUP', 'SIGBREAK'] as const) {
-    try { process.on(sig as any, () => { try { appendFileSync(file, `[${ts()}] telegram channel: received ${sig}\n`) } catch {} }) } catch {}
-  }
-  // Heartbeat — last entry before death tells us when the process was last alive.
-  setInterval(() => {
-    try { appendFileSync(file, `[${ts()}] heartbeat\n`) } catch {}
-  }, 2000).unref()
-  // stdin events — if the MCP host closes its end, this fires before shutdown.
-  try { process.stdin.on('end', () => { try { appendFileSync(file, `[${ts()}] stdin: end\n`) } catch {} }) } catch {}
-  try { process.stdin.on('close', () => { try { appendFileSync(file, `[${ts()}] stdin: close\n`) } catch {} }) } catch {}
-  try { process.stdin.on('error', e => { try { appendFileSync(file, `[${ts()}] stdin: error: ${e}\n`) } catch {} }) } catch {}
-  process.stderr.write(`telegram channel: log started, pid=${process.pid}, file=${file}\n`)
-})()
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
@@ -104,42 +57,13 @@ const PID_FILE = join(STATE_DIR, 'bot.pid')
 // session crashed (SIGKILL, terminal closed) its server.ts grandchild can
 // survive as an orphan and hold the slot forever, so every new session sees
 // 409 Conflict. Kill any stale holder before we start polling.
-//
-// On Windows, process.kill('SIGTERM') is supposed to map to TerminateProcess
-// but in practice with Bun-spawned Node-shaped processes it has been observed
-// to leave the target alive. Use taskkill /F /PID as a hard-kill fallback,
-// then wait briefly and verify the slot is free.
 mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
 try {
   const stale = parseInt(readFileSync(PID_FILE, 'utf8'), 10)
   if (stale > 1 && stale !== process.pid) {
-    process.kill(stale, 0) // throws if already dead — caught below
+    process.kill(stale, 0)
     process.stderr.write(`telegram channel: replacing stale poller pid=${stale}\n`)
-    if (process.platform === 'win32') {
-      try {
-        execFileSync('taskkill', ['/F', '/PID', String(stale)], { stdio: 'ignore', timeout: 3000 })
-        process.stderr.write(`telegram channel: taskkill /F /PID ${stale} issued\n`)
-      } catch (err) {
-        process.stderr.write(`telegram channel: taskkill failed for pid=${stale}: ${err}\n`)
-      }
-    } else {
-      process.kill(stale, 'SIGTERM')
-    }
-    // Verify the kill — give the OS a beat, then check.
-    try {
-      if (typeof (globalThis as any).Bun?.sleepSync === 'function') {
-        ;(globalThis as any).Bun.sleepSync(600)
-      } else {
-        // Node fallback — Atomics-based sync sleep.
-        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 600)
-      }
-      try {
-        process.kill(stale, 0)
-        process.stderr.write(`telegram channel: stale pid=${stale} still alive after kill — expect 409 Conflict\n`)
-      } catch {
-        process.stderr.write(`telegram channel: stale pid=${stale} confirmed dead\n`)
-      }
-    } catch {}
+    process.kill(stale, 'SIGTERM')
   }
 } catch {}
 writeFileSync(PID_FILE, String(process.pid))
@@ -484,13 +408,6 @@ const mcp = new Server(
   },
 )
 
-// Log every MCP notification we emit. Helps diagnose issue #57372 — we can
-// correlate what the plugin told the host (and when) with claude_debug.log.
-function notify(payload: { method: string; params?: unknown }) {
-  process.stderr.write(`telegram channel: MCP notification → ${payload.method}\n`)
-  return mcp.notification(payload as any)
-}
-
 // Stores full permission details for "See more" expansion keyed by request_id.
 const pendingPermissions = new Map<string, { tool_name: string; description: string; input_preview: string }>()
 
@@ -509,7 +426,6 @@ mcp.setNotificationHandler(
     }),
   }),
   async ({ params }) => {
-    process.stderr.write(`telegram channel: MCP notification ← notifications/claude/channel/permission_request request_id=${params.request_id} tool=${params.tool_name}\n`)
     const { request_id, tool_name, description, input_preview } = params
     pendingPermissions.set(request_id, { tool_name, description, input_preview })
     const access = loadAccess()
@@ -526,9 +442,7 @@ mcp.setNotificationHandler(
   },
 )
 
-mcp.setRequestHandler(ListToolsRequestSchema, async () => {
-  process.stderr.write(`telegram channel: MCP request ← tools/list\n`)
-  return ({
+mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
     {
       name: 'reply',
@@ -600,11 +514,9 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => {
       },
     },
   ],
-  })
-})
+}))
 
 mcp.setRequestHandler(CallToolRequestSchema, async req => {
-  process.stderr.write(`telegram channel: MCP request ← tools/call name=${req.params.name}\n`)
   const args = (req.params.arguments ?? {}) as Record<string, unknown>
   try {
     switch (req.params.name) {
@@ -786,9 +698,7 @@ bot.command('help', async ctx => {
     `Messages you send here route to a paired Claude Code session. ` +
     `Text and photos are forwarded; replies and reactions come back.\n\n` +
     `/start — pairing instructions\n` +
-    `/status — check your pairing state\n` +
-    `/menu — diagnostic menu (System / Logs)`,
-    { reply_markup: diagnosticKeyboard() }
+    `/status — check your pairing state`
   )
 })
 
@@ -815,154 +725,11 @@ bot.command('status', async ctx => {
   await ctx.reply(`Not paired. Send me a message to get a pairing code.`)
 })
 
-// Diagnostic menu — opens a persistent reply keyboard with System/Logs buttons.
-// Used to inspect plugin state from inside Telegram, primarily for debugging
-// the MCP-tool-deregistration bug (issue #57372).
-function getClaudeVersion(): string {
-  try {
-    return execFileSync('claude', ['--version'], { encoding: 'utf8', timeout: 5000 }).trim()
-  } catch {
-    return 'unknown'
-  }
-}
-
-function buildSystemInfo(): string {
-  let pluginVersion = 'unknown'
-  try {
-    const manifestPath = join((import.meta as any).dir ?? process.cwd(), '.claude-plugin', 'plugin.json')
-    const pj = JSON.parse(readFileSync(manifestPath, 'utf8'))
-    pluginVersion = pj.version || 'unknown'
-  } catch {}
-  return (
-    `🔧 System Info\n\n` +
-    `Claude Code: ${getClaudeVersion()}\n` +
-    `Telegram Plugin: ${pluginVersion}\n` +
-    `Bot PID: ${process.pid}\n` +
-    `Bun: ${process.versions.bun ?? 'n/a'}\n` +
-    `Node: ${process.versions.node}\n` +
-    `Platform: ${process.platform}`
-  )
-}
-
-function buildLogsTail(): string {
-  const dir = join(homedir(), '.claude', 'channels', 'telegram', 'logs')
-  try {
-    const files = readdirSync(dir).filter(f => f.endsWith('.log'))
-    if (files.length === 0) return '📋 No log files found.'
-    const newest = files
-      .map(f => ({ name: f, mtime: statSync(join(dir, f)).mtimeMs }))
-      .sort((a, b) => b.mtime - a.mtime)[0]
-    const content = readFileSync(join(dir, newest.name), 'utf8')
-    const lines = content.split(/\r?\n/).filter(l => l.length > 0)
-    const last10 = lines.slice(-10).join('\n')
-    const header = `📋 ${newest.name}\n\n`
-    // Telegram message limit is 4096; reserve some headroom for header + truncation marker.
-    const TG_LIMIT = 4000
-    let body = last10
-    if (header.length + body.length > TG_LIMIT) {
-      body = '...(truncated)\n' + body.slice(-(TG_LIMIT - header.length - 20))
-    }
-    return header + body
-  } catch (err) {
-    return `📋 Failed to read logs: ${err}`
-  }
-}
-
-function diagnosticKeyboard() {
-  return {
-    keyboard: new Keyboard().text('System').text('Logs').text('Reload').build(),
-    resize_keyboard: true,
-    is_persistent: true,
-  }
-}
-
-bot.command('menu', async ctx => {
-  if (!dmCommandGate(ctx)) return
-  await ctx.reply('Diagnostic menu — use the buttons below.', {
-    reply_markup: diagnosticKeyboard(),
-  })
-})
-
-// Inline-button handler. Two callback families:
-//   - `reload:(a|b|c|d|ac)` from /menu's Reload variants
-//   - `perm:(allow|deny|more):<id>` from permission requests
-// Security: paired-only (allowFrom must contain the sender).
+// Inline-button handler for permission requests. Callback data is
+// `perm:allow:<id>`, `perm:deny:<id>`, or `perm:more:<id>`.
+// Security mirrors the text-reply path: allowFrom must contain the sender.
 bot.on('callback_query:data', async ctx => {
   const data = ctx.callbackQuery.data
-  process.stderr.write(`telegram channel: callback_query received: data=${data}, from=${ctx.from.id}\n`)
-
-  // --- Reload variants (DM-only, paired senders only) ---
-  const reloadM = /^reload:(a|b|c|d|ac)$/.exec(data)
-  if (reloadM) {
-    const access = loadAccess()
-    const senderId = String(ctx.from.id)
-    if (!access.allowFrom.includes(senderId)) {
-      await ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {})
-      return
-    }
-    const variant = reloadM[1]
-    const remind = 'ℹ️ Run /reload-plugins in the Claude Code terminal.'
-    try {
-      if (variant === 'a') {
-        await ctx.editMessageText(`🅰️ Variant A\n\n${remind}`).catch(() => {})
-      } else if (variant === 'b') {
-        // PowerShell cold-start + Add-Type + Start-Sleep can exceed 4–5 sec.
-        // Use fire-and-forget spawn: we don't wait for the process to finish,
-        // we just dispatch the keystrokes. The chat message confirms dispatch,
-        // not execution outcome.
-        const ps = `Add-Type -AssemblyName System.Windows.Forms; Start-Sleep -Milliseconds 500; [System.Windows.Forms.SendKeys]::SendWait('/reload-plugins{ENTER}')`
-        try {
-          const child = spawn('powershell', ['-NoProfile', '-Command', ps], {
-            detached: true,
-            stdio: 'ignore',
-            windowsHide: true,
-          })
-          child.on('error', err => {
-            process.stderr.write(`telegram channel: variant B spawn error: ${err}\n`)
-          })
-          child.unref()
-          await ctx.editMessageText(
-            `🅱️ Variant B\n\nDispatched "/reload-plugins↵" via PowerShell SendKeys (fire-and-forget). ` +
-            `If the wrong window was focused at the moment of dispatch, the keystrokes went there.`,
-          ).catch(() => {})
-        } catch (e) {
-          await ctx.editMessageText(`🅱️ Variant B failed: ${e}`).catch(() => {})
-        }
-      } else if (variant === 'c') {
-        try {
-          await notify({ method: 'notifications/tools/list_changed' })
-          await ctx.editMessageText(
-            `🅲 Variant C\n\nSent MCP notifications/tools/list_changed. ` +
-            `Watch claude_debug.log to see whether the host issues a fresh tools/list and re-registers the four telegram tools.`,
-          ).catch(() => {})
-        } catch (e) {
-          await ctx.editMessageText(`🅲 Variant C failed: ${e}`).catch(() => {})
-        }
-      } else if (variant === 'd') {
-        await ctx.editMessageText(
-          `🅳 Variant D\n\nExiting plugin process in 250ms. The MCP stdio host may respawn the bot — or it may not.`,
-        ).catch(() => {})
-        await ctx.answerCallbackQuery().catch(() => {})
-        setTimeout(() => process.exit(0), 250)
-        return
-      } else if (variant === 'ac') {
-        let cMsg: string
-        try {
-          await notify({ method: 'notifications/tools/list_changed' })
-          cMsg = '✅ MCP notifications/tools/list_changed sent.'
-        } catch (e) {
-          cMsg = `❌ Notification failed: ${e}`
-        }
-        await ctx.editMessageText(`🆎 Variant A+C\n\n${cMsg}\n\n${remind}`).catch(() => {})
-      }
-    } catch (err) {
-      process.stderr.write(`telegram channel: reload variant ${variant} error: ${err}\n`)
-    }
-    await ctx.answerCallbackQuery().catch(() => {})
-    return
-  }
-
-  // --- Permission-request handler ---
   const m = /^perm:(allow|deny|more):([a-km-z]{5})$/.exec(data)
   if (!m) {
     await ctx.answerCallbackQuery().catch(() => {})
@@ -1002,7 +769,7 @@ bot.on('callback_query:data', async ctx => {
     return
   }
 
-  void notify({
+  void mcp.notification({
     method: 'notifications/claude/channel/permission',
     params: { request_id, behavior },
   })
@@ -1018,40 +785,7 @@ bot.on('callback_query:data', async ctx => {
 })
 
 bot.on('message:text', async ctx => {
-  const text = ctx.message.text
-  // Diagnostic menu buttons — DM-only, paired-senders-only.
-  if (text === 'System' || text === 'Logs' || text === 'Reload') {
-    const gated = dmCommandGate(ctx)
-    if (!gated) return
-    if (!gated.access.allowFrom.includes(gated.senderId)) return
-    if (text === 'System') {
-      await ctx.reply(buildSystemInfo())
-      return
-    }
-    if (text === 'Logs') {
-      await ctx.reply(buildLogsTail())
-      return
-    }
-    if (text === 'Reload') {
-      const ikb = new InlineKeyboard()
-        .text('🅰️ A — chat reminder', 'reload:a').row()
-        .text('🅱️ B — SendKeys to terminal', 'reload:b').row()
-        .text('🅲 C — tools/list_changed notify', 'reload:c').row()
-        .text('🅳 D — exit & let host respawn', 'reload:d').row()
-        .text('🆎 A+C — notify + reminder', 'reload:ac')
-      await ctx.reply(
-        `Reload — pick a variant:\n\n` +
-        `🅰️ A — Send a chat reminder; you run /reload-plugins manually in the Claude Code terminal. Safest, no automation.\n\n` +
-        `🅱️ B — PowerShell SendKeys: types "/reload-plugins↵" into the *currently focused* window. Requires the Claude Code terminal to be focused — otherwise typed into the wrong app. Risky.\n\n` +
-        `🅲 C — Emit MCP "notifications/tools/list_changed" from this plugin. Tests whether the host re-registers tools without /reload-plugins. Diagnostic value for issue #57372.\n\n` +
-        `🅳 D — Exit the plugin process. The MCP stdio host *may* respawn it; recovery not guaranteed.\n\n` +
-        `🆎 A+C — Send the MCP notification AND a chat reminder. Best of both: probes the bug while keeping a manual fallback.`,
-        { reply_markup: ikb }
-      )
-      return
-    }
-  }
-  await handleInbound(ctx, text, undefined)
+  await handleInbound(ctx, ctx.message.text, undefined)
 })
 
 bot.on('message:photo', async ctx => {
@@ -1192,7 +926,7 @@ async function handleInbound(
   // (non-allowlisted senders were dropped above), so we trust the reply.
   const permMatch = PERMISSION_REPLY_RE.exec(text)
   if (permMatch) {
-    void notify({
+    void mcp.notification({
       method: 'notifications/claude/channel/permission',
       params: {
         request_id: permMatch[2]!.toLowerCase(),
@@ -1226,7 +960,7 @@ async function handleInbound(
 
   // image_path goes in meta only — an in-content "[image attached — read: PATH]"
   // annotation is forgeable by any allowlisted sender typing that string.
-  notify({
+  mcp.notification({
     method: 'notifications/claude/channel',
     params: {
       content: text,

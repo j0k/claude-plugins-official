@@ -1,2 +1,7 @@
 *.DS_Store
 .claude/
+
+# Plugin runtime artifacts (created when running from cache)
+node_modules/
+.in_use/
+*.tmp.*
