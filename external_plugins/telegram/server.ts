@@ -1169,9 +1169,17 @@ async function handleInbound(
   downloadImage: (() => Promise<string | undefined>) | undefined,
   attachment?: AttachmentMeta,
 ): Promise<void> {
+  const from = ctx.from
+  const chatId = String(ctx.chat?.id ?? '?')
+  const preview = text.slice(0, 80).replace(/\n/g, '\\n')
+  process.stderr.write(`telegram channel: inbound message from ${from?.username ?? from?.id ?? '?'} (chat=${chatId}): ${preview}${text.length > 80 ? '...' : ''}\n`)
+
   const result = gate(ctx)
 
-  if (result.action === 'drop') return
+  if (result.action === 'drop') {
+    process.stderr.write(`telegram channel: inbound dropped (gate policy)\n`)
+    return
+  }
 
   if (result.action === 'pair') {
     const lead = result.isResend ? 'Still pending' : 'Pairing required'
@@ -1226,6 +1234,7 @@ async function handleInbound(
 
   // image_path goes in meta only — an in-content "[image attached — read: PATH]"
   // annotation is forgeable by any allowlisted sender typing that string.
+  process.stderr.write(`telegram channel: delivering inbound to Claude (user=${from.username ?? from.id}, len=${text.length})\n`)
   notify({
     method: 'notifications/claude/channel',
     params: {
