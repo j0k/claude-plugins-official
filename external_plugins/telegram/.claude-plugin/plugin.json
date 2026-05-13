@@ -1,11 +1,12 @@
 {
   "name": "telegram",
-  "description": "Telegram channel for Claude Code \u2014 messaging bridge with built-in access control. Manage pairing, allowlists, and policy via /telegram:access.",
-  "version": "0.0.6",
+  "description": "Telegram bridge for Claude Code via a decoupled daemon (bypasses issue #57372). Pure-tools MCP plugin + independent bot process + file-based queue. Includes web UI on localhost:9999 and PowerShell tooling.",
+  "version": "0.1.0",
   "keywords": [
     "telegram",
     "messaging",
-    "channel",
-    "mcp"
+    "mcp",
+    "daemon",
+    "queue"
   ]
 }

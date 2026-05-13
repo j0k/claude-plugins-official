@@ -1,99 +1,239 @@
-# Telegram
+# Telegram (decoupled-daemon architecture)
 
-Connect a Telegram bot to your Claude Code with an MCP server.
+Connect a Telegram bot to Claude Code through a separate background daemon. The daemon owns the bot connection; the MCP plugin talks to Claude Code via a file-based queue. This bypasses [issue #57372](https://github.com/anthropics/claude-code/issues/57372) — the MCP plugin does not declare `claude/channel` and therefore avoids the host's buggy channel-capable lifecycle entirely.
 
-The MCP server logs into Telegram as a bot and provides tools to Claude to reply, react, or edit messages. When you message the bot, the server forwards the message to your Claude Code session.
+## Architecture
+
+```
+   Telegram API
+        ↓ long-poll
+┌─────────────────────────────────┐
+│  telegram-bot-daemon            │   independent process
+│  - holds bot token              │   started at login (Task Scheduler)
+│  - writes inbound to queue/inbox│   or manually via start-daemon.ps1
+│  - reads outbound from outbox/  │   one instance per machine (PID lock)
+│  - serves web UI on :9999       │
+└─────────────┬───────────────────┘
+              │
+              │  file-based queue (atomic rename)
+              ↓
+┌─────────────────────────────────┐
+│  ~/.claude/channels/telegram/   │
+│    queue/inbox/                 │
+│    queue/outbox/                │
+│    queue/processed/             │
+│    state.json                   │
+│    events.jsonl                 │
+└─────────────┬───────────────────┘
+              │
+              ↑  read/write queue files
+┌─────────────────────────────────┐
+│  MCP plugin (server.ts)         │   spawned by Claude Code per session
+│  - NO claude/channel capability │   pure tools, like playwright
+│  - tools: send_message,         │   immune to issue #57372
+│    read_inbox, wait_for_message,│
+│    daemon_status, etc.          │
+│  - 15s ping-pong notify         │
+└─────────────────────────────────┘
+              ↑
+              │  stdio
+          Claude Code
+```
+
+## Wakeup model
+
+Because the MCP plugin doesn't push notifications to Claude, **Claude must poll** for new messages. Three modes:
+
+| Mode | How | When to use |
+|---|---|---|
+| **Manual** | `read_inbox` tool | "Check telegram for new messages" — one-off |
+| **Active watch** | `wait_for_message` in a loop | User says "watch the chat"; Claude long-polls 30–60s at a time |
+| **Scheduled** | `/loop 30s /check-telegram` | Background mode; Claude checks every N sec |
+
+`peek_inbox` is cheap and doesn't drain the queue or update state — use it freely.
+
+## 15-second ping-pong
+
+To keep tools alive in the host registry (workaround for any residual flake), the plugin emits `notifications/tools/list_changed` every 15 seconds. The host's "pong" — a fresh `tools/list` request — is logged for verification. See `events.jsonl` for `ping.tools_list_changed` and `mcp.request.in` records.
 
 ## Prerequisites
 
-- [Bun](https://bun.sh) — the MCP server runs on Bun. Install with `curl -fsSL https://bun.sh/install | bash`.
+- [Bun](https://bun.sh) — `curl -fsSL https://bun.sh/install | bash`
+- Windows 10+ for the supplied install scripts (Task Scheduler). Daemon itself is cross-platform.
 
-## Quick Setup
-> Default pairing flow for a single-user DM bot. See [ACCESS.md](./ACCESS.md) for groups and multi-user setups.
+## Setup
 
-**1. Create a bot with BotFather.**
+### 1. Create a bot with BotFather
 
-Open a chat with [@BotFather](https://t.me/BotFather) on Telegram and send `/newbot`. BotFather asks for two things:
+DM [@BotFather](https://t.me/BotFather), send `/newbot`, follow prompts. Save the token (e.g. `123456789:AAH...`).
 
-- **Name** — the display name shown in chat headers (anything, can contain spaces)
-- **Username** — a unique handle ending in `bot` (e.g. `my_assistant_bot`). This becomes your bot's link: `t.me/my_assistant_bot`.
+### 2. Install the plugin in Claude Code
 
-BotFather replies with a token that looks like `123456789:AAHfiqksKZ8...` — that's the whole token, copy it including the leading number and colon.
-
-**2. Install the plugin.**
-
-These are Claude Code commands — run `claude` to start a session first.
-
-Install the plugin:
 ```
 /plugin install telegram@claude-plugins-official
 /reload-plugins
 ```
 
-**3. Give the server the token.**
+### 3. Configure the token
 
 ```
-/telegram:configure 123456789:AAHfiqksKZ8...
+/telegram:configure 123456789:AAH...
 ```
 
-Writes `TELEGRAM_BOT_TOKEN=...` to `~/.claude/channels/telegram/.env`. You can also write that file by hand, or set the variable in your shell environment — shell takes precedence.
+Writes `~/.claude/channels/telegram/.env`.
 
-> To run multiple bots on one machine (different tokens, separate allowlists), point `TELEGRAM_STATE_DIR` at a different directory per instance.
+### 4. Start the daemon
 
-**4. Relaunch with the channel flag.**
+Pick one:
 
-The server won't connect without this — exit your session and start a new one:
-
-```sh
-claude --channels plugin:telegram@claude-plugins-official
+**Manual (recommended for testing):**
+```powershell
+.\external_plugins\telegram\scripts\start-daemon.ps1
 ```
 
-**5. Pair.**
-
-With Claude Code running from the previous step, DM your bot on Telegram — it replies with a 6-character pairing code. If the bot doesn't respond, make sure your session is running with `--channels`. In your Claude Code session:
-
-```
-/telegram:access pair <code>
+**Auto-start at login (recommended for daily use):**
+```powershell
+.\external_plugins\telegram\scripts\install-daemon.ps1
 ```
 
-Your next DM reaches the assistant.
+**From within Claude Code:**
+Just call the `start_daemon` tool. The plugin will spawn it detached.
 
-> Unlike Discord, there's no server invite step — Telegram bots accept DMs immediately. Pairing handles the user-ID lookup so you never touch numeric IDs.
+### 5. Pair your Telegram account
 
-**6. Lock it down.**
+```
+/telegram:access pair  # generates code
+```
 
-Pairing is for capturing IDs. Once you're in, switch to `allowlist` so strangers don't get pairing-code replies. Ask Claude to do it, or `/telegram:access policy allowlist` directly.
+Then DM the bot any message — it asks for the code. After pairing, the bot accepts your DMs.
 
-## Access control
+### 6. Use it
 
-See **[ACCESS.md](./ACCESS.md)** for DM policies, groups, mention detection, delivery config, skill commands, and the `access.json` schema.
+In Claude Code:
+```
+"Check my Telegram messages"           # → calls read_inbox
+"Watch Telegram for 5 minutes"         # → calls wait_for_message in loop
+"Reply to chat 123456 saying 'hi'"     # → calls send_message
+```
 
-Quick reference: IDs are **numeric user IDs** (get yours from [@userinfobot](https://t.me/userinfobot)). Default policy is `pairing`. `ackReaction` only accepts Telegram's fixed emoji whitelist.
+For background watch: `/loop 30s /check-telegram-messages` (write a small skill that calls `read_inbox`).
 
-## Tools exposed to the assistant
+## MCP tools
 
 | Tool | Purpose |
-| --- | --- |
-| `reply` | Send to a chat. Takes `chat_id` + `text`, optionally `reply_to` (message ID) for native threading and `files` (absolute paths) for attachments. Images (`.jpg`/`.png`/`.gif`/`.webp`) send as photos with inline preview; other types send as documents. Max 50MB each. Auto-chunks text; files send as separate messages after the text. Returns the sent message ID(s). |
-| `react` | Add an emoji reaction to a message by ID. **Only Telegram's fixed whitelist** is accepted (👍 👎 ❤ 🔥 👀 etc). |
-| `edit_message` | Edit a message the bot previously sent. Useful for "working…" → result progress updates. Only works on the bot's own messages. |
+|---|---|
+| `send_message` | Queue an outbound message (chat_id, text, files, reply_to, format). Returns immediately; pass `wait: true` to block up to 30s for delivery confirmation. |
+| `react` | Add emoji reaction (queued). |
+| `edit_message` | Edit a previously-sent message (queued). Edits don't trigger push notifications. |
+| `read_inbox` | Drain pending messages from queue. Updates last-read state. |
+| `peek_inbox` | Count pending messages without draining. Safe to call frequently. |
+| `wait_for_message` | Block up to N seconds (max 60) for new messages. Uses fs.watch + 1s poll fallback. |
+| `daemon_status` | Check daemon aliveness via heartbeat file age. |
+| `start_daemon` | Spawn the daemon if not running. Idempotent. |
+| `download_attachment` | Fetch a non-photo attachment by file_id. |
 
-Inbound messages trigger a typing indicator automatically — Telegram shows
-"botname is typing…" while the assistant works on a response.
+## Daemon management (PowerShell)
 
-## Photos
+All under `scripts/`:
 
-Inbound photos are downloaded to `~/.claude/channels/telegram/inbox/` and the
-local path is included in the `<channel>` notification so the assistant can
-`Read` it. Telegram compresses photos — if you need the original file, send it
-as a document instead (long-press → Send as File).
+| Script | Purpose |
+|---|---|
+| `start-daemon.ps1` | Manual start. Refuses to start if already alive. |
+| `stop-daemon.ps1` | Graceful stop, falls back to `taskkill /F`. |
+| `status-daemon.ps1` | Report PID, uptime, heartbeat age, queue counts. |
+| `install-daemon.ps1` | Register in Windows Task Scheduler (auto-start at login). |
+| `uninstall-daemon.ps1` | Remove from Task Scheduler. |
+| `telegram-tail.ps1` | **Unified live tail** of daemon + plugin + events logs with color coding. |
 
-## No history or search
+### `telegram-tail.ps1` flags
 
-Telegram's Bot API exposes **neither** message history nor search. The bot
-only sees messages as they arrive — no `fetch_messages` tool exists. If the
-assistant needs earlier context, it will ask you to paste or summarize.
+```powershell
+.\telegram-tail.ps1                          # all logs, all levels
+.\telegram-tail.ps1 -ErrorsOnly              # only warn/error
+.\telegram-tail.ps1 -EventsOnly              # only structured events.jsonl
+.\telegram-tail.ps1 -Grep "tools/call"       # filter to matching lines
+.\telegram-tail.ps1 -InitialLines 100        # how much history to show on start
+```
 
-This also means there's no `download_attachment` tool for historical messages
-— photos are downloaded eagerly on arrival since there's no way to fetch them
-later.
+## Debug interfaces
+
+### Web UI
+
+The daemon serves a live dashboard at **http://127.0.0.1:9999** (configurable via `TELEGRAM_WEB_PORT`):
+- Daemon status (pid, uptime, bot username)
+- State (last_read per chat)
+- Inbox & outbox panels (with content preview)
+- Live events stream (color-coded by source/level)
+
+Auto-refreshes every 3 sec. No auth — localhost-only.
+
+### Telegram-side dashboard (`/menu`-style commands)
+
+After pairing, DM the bot:
+- `/queue` — inbox/outbox counts
+- `/daemon` — daemon status (pid, uptime, bot username, web URL)
+- `/web` — show web UI URL
+
+### `events.jsonl` structured log
+
+Every meaningful event from both daemon and plugin lands in `~/.claude/channels/telegram/events.jsonl`, one JSON record per line:
+
+```json
+{"ts":"2026-05-12T15:00:00.000Z","source":"daemon","level":"info","event":"tg.received","chat_id":"52160369","user":"alice","preview":"Hi"}
+{"ts":"2026-05-12T15:00:00.123Z","source":"daemon","level":"info","event":"inbox.write","chat_id":"52160369","msg_id":"10058","user":"alice","type":"text"}
+{"ts":"2026-05-12T15:00:05.500Z","source":"plugin","level":"info","event":"mcp.tool_call","tool":"read_inbox"}
+{"ts":"2026-05-12T15:00:05.510Z","source":"plugin","level":"info","event":"inbox.read","count":1,"chat_id":null}
+```
+
+Filter with `Select-String`, `jq`, or the tail script's `-Grep`.
+
+### Per-pid plaintext logs
+
+Both processes also mirror stderr to log files (timestamped, plain text):
+
+```
+~/.claude/channels/telegram/logs/
+  daemon/daemon_YYYY_MM_DD__HH_MM_<pid>.log
+  plugin/plugin_YYYY_MM_DD__HH_MM_<pid>.log
+```
+
+Useful for grep'ing specific runs.
+
+## Queue protocol
+
+| Path | Direction | Contents |
+|---|---|---|
+| `queue/inbox/*.json` | daemon → plugin | One inbound message per file |
+| `queue/outbox/*.json` | plugin → daemon | One outbound work item per file |
+| `queue/processed/inbox/` | archive | Inbox items already consumed by plugin |
+| `queue/processed/outbox/` | archive | Outbox items + their result.json |
+| `state.json` | shared | `last_read_at`, `last_read_per_chat`, `daemon` info |
+| `events.jsonl` | shared | Append-only structured event log |
+| `daemon.pid` | daemon | Daemon's PID (advisory lock) |
+| `daemon.heartbeat` | daemon | Touched every 2s, liveness probe |
+
+All file writes use atomic rename (write `.tmp`, then rename). Readers filter to `.json` extensions only, so they never see a half-written file.
+
+## What's intentionally not supported
+
+- **Permission relay via Telegram inline buttons.** That required `claude/channel/permission` capability, which we dropped. Approve permission requests in your Claude Code terminal as usual.
+- **Automatic wakeup on new message.** Tradeoff for bypassing the bug. Use `wait_for_message` or `/loop` instead.
+- **Concurrent daemons on one machine.** Telegram allows exactly one getUpdates consumer per token. PID-file lock enforces this.
+
+## Troubleshooting
+
+| Symptom | Check |
+|---|---|
+| "Tool not found" | `daemon_status` — daemon dead? Run `start-daemon.ps1`. |
+| Messages queued but not sent | `daemon.heartbeat` age > 10s. Daemon stuck or dead. |
+| New messages not appearing | Did you call `read_inbox` or `wait_for_message`? No automatic push. |
+| Web UI unreachable | Daemon might not have started yet. Check `status-daemon.ps1`. |
+| Pairing isn't working | Check `access.json` and `approved/` directory. Run skill again. |
+
+## State directory
+
+Override with `TELEGRAM_STATE_DIR` env var. Default: `~/.claude/channels/telegram/`.
+
+## License
+
+Apache-2.0
