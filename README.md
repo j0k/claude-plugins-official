@@ -250,6 +250,117 @@ claude --channels plugin:telegram@claude-plugins-official `
 - https://github.com/anthropics/claude-code/issues/57372
 
 ---
+
+## Phase 3 Testing Protocol: Capture Failure
+
+**Goal:** Run a session with synchronized plugin + host logs, reproduce the tool-deregistration failure, and correlate the logs to identify the root cause.
+
+### Prerequisites
+
+1. **Telegram bot token** — set up in `~/.claude/channels/telegram/.env`:
+   ```
+   TELEGRAM_BOT_TOKEN=123456789:AAH...
+   ```
+2. **Paired Telegram user** — run `/telegram:access pair <code>` in a Claude Code terminal
+3. **Fresh log directory** — clean up old logs to avoid confusion:
+   ```powershell
+   Remove-Item "$env:USERPROFILE\.claude\channels\telegram\logs\*" -Force
+   ```
+
+### Session Launch
+
+Start Claude Code with debug logging + the Telegram plugin:
+
+```powershell
+$debugLog = "$env:USERPROFILE\.claude\claude_debug_phase3_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+
+claude --channels plugin:telegram@claude-plugins-official `
+       --dangerously-skip-permissions `
+       --debug "mcp,api" `
+       --debug-file $debugLog
+
+Write-Host "Debug log: $debugLog"
+Write-Host "Plugin logs: $env:USERPROFILE\.claude\channels\telegram\logs\"
+```
+
+(The timestamp in the filename prevents log overwrite and makes correlation easier.)
+
+### Reproduction Steps
+
+1. **Establish baseline** (first 2 min): Send a Telegram message; verify the bot replies from Claude Code. Confirm `Dynamic tool loading: 1/46` in the debug log.
+
+2. **Wait passively** (next 3–4 min): Send periodic Telegram messages (every 30s or so) to generate inbound traffic. This creates a continuous stream of MCP notifications, which should help expose the failure if the bug is cache-rotation driven.
+
+3. **Hit the tool call** (~5 min mark): Once ~5 min have elapsed, send a Telegram message that explicitly asks the model to call a Telegram tool — e.g., "send me a reaction" or "edit your last message with an emoji". This forces a `reply` or `react` tool call, which will fail if tools have disappeared.
+
+4. **Capture the error** — copy the error from Claude Code's terminal. It should be:
+   ```
+   Error: Tool mcp__plugin_telegram_telegram__reply not found
+   ```
+   Note the **exact timestamp** (to the second).
+
+5. **Wait 30 more seconds** — let the logs accumulate. The host should emit `Dynamic tool loading: 0/42` and a cascade of `Filtering out tool_reference` warnings.
+
+6. **Exit and collect logs**:
+   ```powershell
+   # Plugin logs (one per pid)
+   $pluginLogs = Get-ChildItem "$env:USERPROFILE\.claude\channels\telegram\logs\" -Filter "*.log" | Sort-Object LastWriteTime -Descending
+   
+   # Print paths for external inspection
+   "Plugin logs:"
+   $pluginLogs | ForEach-Object { Write-Host $_.FullName }
+   
+   # Copy to a safe location for analysis
+   $analysisDir = "$env:USERPROFILE\Documents\phase3_repro_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+   New-Item -ItemType Directory -Path $analysisDir -Force | Out-Null
+   Copy-Item $debugLog -Destination $analysisDir
+   Copy-Item $pluginLogs.FullName -Destination $analysisDir
+   Write-Host "Analysis directory: $analysisDir"
+   ```
+
+### Analysis Template
+
+After each repro, fill in this table to track patterns:
+
+| Repro | Time to Fail | Activity Level | Last Plugin Event | Host Marker | Tool Count Drop | Notes |
+|-------|--------------|---|---|---|---|---|
+| #1    | ??:??        | low / med / high | `heartbeat` / `notify` / `tools/call` | 1/46 → 0/42 | yes / no | |
+| #2    | ??:??        | low / med / high | (copy from log) | (copy from `Dynamic tool`) | yes / no | |
+| #3    | ??:??        | low / med / high | (copy from log) | (copy from `Dynamic tool`) | yes / no | |
+
+**Key questions at each repro:**
+
+- At the **exact timestamp of the error**, what is the last line in the plugin log?
+  - If it's a heartbeat, the process was alive.
+  - If it's stdin/close, the host killed the connection.
+  - If it's an MCP request, the protocol may have been mid-flight.
+- How many seconds **before the `Tool not found` error** does the plugin log go silent?
+- Do we see `Channel notifications registered` **twice** in the host log around the failure time?
+- Is there any `cache` or `prefix` mention in the host log near the failure?
+
+### Go/No-Go Criteria
+
+**Repro succeeded if:**
+- ✅ The tool-not-found error fires at ~4–5 min or later
+- ✅ `Dynamic tool loading: 1/46 → 0/42` appears in the host log
+- ✅ Plugin logs exist and contain heartbeats + lifecycle events
+- ✅ We can correlate a specific plugin log line to the exact moment of host-side failure
+
+**Repro failed if:**
+- ❌ Session runs 10+ min without failure (timeout, probably need more activity)
+- ❌ Plugin logs are empty or missing (debugging infrastructure issue)
+- ❌ Host log contains no `Dynamic tool loading` line (wrong Claude Code version or plugin not registered)
+
+### Success Path
+
+Once you have 2–3 synchronized repros, upload:
+1. **All plugin logs** (`~/.claude/channels/telegram/logs/*.log` from each repro)
+2. **All host debug logs** (the files created with `--debug-file`)
+3. **The filled analysis table** (paste into issue comment or here in the README)
+
+This will unlock hypothesis validation — we can compare timelines and determine whether the failure is truly cache-rotation-timed, whether the plugin is still alive, and which of the four hypotheses is most consistent with the data.
+
+---
 ---
 
 # Original README (Claude Code Plugins Directory)
