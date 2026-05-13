@@ -33,7 +33,7 @@ import {
   watch,
   writeFileSync,
 } from 'fs'
-import { spawn } from 'child_process'
+import { spawn, execFileSync } from 'child_process'
 import { join } from 'path'
 import {
   STATE_DIR,
@@ -265,7 +265,13 @@ const TOOLS = [
   {
     name: 'daemon_status',
     description:
-      'Check whether the telegram daemon is running (via heartbeat file age). Returns pid, uptime, last heartbeat age, and bot username if known.',
+      'Check whether the telegram daemon is running. Returns pid, uptime, heartbeat age, bot username, queue counts (inbox/outbox pending), and last_read timestamps.',
+    inputSchema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'bot_status',
+    description:
+      'Verify Telegram bot reachability by calling Telegram getMe directly (independent of daemon). Confirms the token is valid and Telegram is reachable. Returns bot id, username, permissions.',
     inputSchema: { type: 'object', properties: {} },
   },
   {
@@ -276,6 +282,23 @@ const TOOLS = [
       type: 'object',
       properties: {
         web_port: { type: 'integer', description: 'Override TELEGRAM_WEB_PORT.' },
+      },
+    },
+  },
+  {
+    name: 'stop_daemon',
+    description:
+      'Stop the running telegram daemon by PID. Uses taskkill /F on Windows, SIGTERM elsewhere. Idempotent — reports not_running if no daemon.',
+    inputSchema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'restart_daemon',
+    description:
+      'Restart the telegram daemon: stop running instance, wait for clean shutdown, start a new instance, wait for fresh heartbeat. Use when daemon is unresponsive or after config changes.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        web_port: { type: 'integer', description: 'Override TELEGRAM_WEB_PORT for the new instance.' },
       },
     },
   },
@@ -439,13 +462,57 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const alive = isDaemonAlive(10_000)
         const pid = getDaemonPid()
         const state = loadState()
+        const inboxPending = listQueueFiles(INBOX_DIR).length
+        const outboxPending = listQueueFiles(join(STATE_DIR, 'queue', 'outbox')).length
+        const startedAt = state.daemon?.started_at
+        const uptimeSec = startedAt
+          ? Math.max(0, Math.floor((Date.now() - new Date(startedAt).getTime()) / 1000))
+          : null
         return jsonText({
           alive,
           pid,
           heartbeat_age_ms: age,
+          uptime_sec: uptimeSec,
           bot_username: state.daemon?.username ?? null,
-          started_at: state.daemon?.started_at ?? null,
+          started_at: startedAt ?? null,
+          queue: {
+            inbox_pending: inboxPending,
+            outbox_pending: outboxPending,
+          },
+          last_read_at: state.last_read_at ?? null,
+          last_read_per_chat: state.last_read_per_chat,
         })
+      }
+
+      case 'bot_status': {
+        const token = process.env.TELEGRAM_BOT_TOKEN
+        if (!token) {
+          return jsonText({ reachable: false, error: 'TELEGRAM_BOT_TOKEN not set' }, true)
+        }
+        try {
+          const r = await fetch(`https://api.telegram.org/bot${token}/getMe`, {
+            signal: AbortSignal.timeout(5000),
+          })
+          const j = (await r.json()) as any
+          if (!j.ok) {
+            return jsonText({ reachable: false, error: j.description ?? 'getMe failed', raw: j }, true)
+          }
+          return jsonText({
+            reachable: true,
+            id: j.result.id,
+            username: j.result.username,
+            first_name: j.result.first_name,
+            is_bot: j.result.is_bot,
+            can_join_groups: j.result.can_join_groups,
+            can_read_all_group_messages: j.result.can_read_all_group_messages,
+            supports_inline_queries: j.result.supports_inline_queries,
+          })
+        } catch (err) {
+          return jsonText(
+            { reachable: false, error: err instanceof Error ? err.message : String(err) },
+            true,
+          )
+        }
       }
 
       case 'start_daemon': {
@@ -454,6 +521,106 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         }
         const spawned = spawnDaemon(args.web_port ? Number(args.web_port) : undefined)
         return jsonText({ spawned: true, ...spawned })
+      }
+
+      case 'stop_daemon': {
+        const pid = getDaemonPid()
+        if (!pid) {
+          return jsonText({ stopped: false, was_pid: null, method: 'not_running' })
+        }
+        let alive = false
+        try {
+          process.kill(pid, 0)
+          alive = true
+        } catch {}
+        if (!alive) {
+          return jsonText({ stopped: false, was_pid: pid, method: 'stale_pid_file' })
+        }
+        let method: 'taskkill' | 'sigterm' = 'sigterm'
+        try {
+          if (process.platform === 'win32') {
+            execFileSync('taskkill', ['/F', '/PID', String(pid)], {
+              stdio: 'ignore',
+              timeout: 3000,
+            })
+            method = 'taskkill'
+          } else {
+            process.kill(pid, 'SIGTERM')
+          }
+        } catch (err) {
+          return jsonText(
+            { stopped: false, was_pid: pid, error: String(err) },
+            true,
+          )
+        }
+        // Verify dead (poll up to 3s).
+        for (let i = 0; i < 30; i++) {
+          await new Promise(r => setTimeout(r, 100))
+          try {
+            process.kill(pid, 0)
+          } catch {
+            return jsonText({ stopped: true, was_pid: pid, method })
+          }
+        }
+        return jsonText(
+          { stopped: false, was_pid: pid, method, error: 'still alive after 3s' },
+          true,
+        )
+      }
+
+      case 'restart_daemon': {
+        const wasPid = getDaemonPid()
+        // Stop if alive.
+        if (wasPid) {
+          let isAlive = false
+          try {
+            process.kill(wasPid, 0)
+            isAlive = true
+          } catch {}
+          if (isAlive) {
+            try {
+              if (process.platform === 'win32') {
+                execFileSync('taskkill', ['/F', '/PID', String(wasPid)], {
+                  stdio: 'ignore',
+                  timeout: 3000,
+                })
+              } else {
+                process.kill(wasPid, 'SIGTERM')
+              }
+            } catch {}
+            // Wait for shutdown.
+            for (let i = 0; i < 30; i++) {
+              await new Promise(r => setTimeout(r, 100))
+              try {
+                process.kill(wasPid, 0)
+              } catch {
+                break
+              }
+            }
+          }
+        }
+        // Start new instance.
+        const spawned = spawnDaemon(args.web_port ? Number(args.web_port) : undefined)
+        // Wait for heartbeat.
+        for (let i = 0; i < 50; i++) {
+          await new Promise(r => setTimeout(r, 200))
+          if (isDaemonAlive(5_000)) {
+            return jsonText({
+              restarted: true,
+              stopped_pid: wasPid,
+              new_pid: spawned.pid ?? getDaemonPid(),
+            })
+          }
+        }
+        return jsonText(
+          {
+            restarted: false,
+            stopped_pid: wasPid,
+            new_pid: spawned.pid,
+            error: 'new daemon did not heartbeat within 10s',
+          },
+          true,
+        )
       }
 
       case 'download_attachment': {
