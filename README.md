@@ -6,11 +6,15 @@
 
 ## Why this fork exists
 
-The official Telegram plugin (v0.0.6) declares `claude/channel` capability and uses push notifications to deliver messages to Claude Code. The host has a bug ([#57372](https://github.com/anthropics/claude-code/issues/57372)) where it silently drops MCP tools for `claude/channel`-capable stdio servers after ~5 minutes of session uptime. Tools just vanish from the registry; the only recovery is `/reload-plugins` or a full restart.
+The official Telegram plugin (v0.0.6) declares `claude/channel` capability and uses push notifications to deliver messages to Claude Code. It looks that the host (Claude Code Version
+2.1.133 and Official Telegram Plugin 0.0.6) has a bug ([#57372](https://github.com/anthropics/claude-code/issues/57372)) where it silently drops MCP tools for `claude/channel`-capable stdio servers after ~5 minutes of session uptime. Tools just vanish from the registry; the only recovery is `/reload-plugins` or a full restart.
 
 A `playwright` MCP server in the same session (no `claude/channel`) is unaffected for hours. That differential pointed at the host's `claude/channel` lifecycle as the bug surface.
 
 **This fork sidesteps the bug architecturally**: the Telegram plugin no longer declares `claude/channel`. The bot itself runs in a separate daemon process; the MCP plugin is a pure-tools shim that reads and writes a file-based queue.
+
+Deamon dashboard look is below.
+![Daemon Dashboard](img/localhost_9999.png)
 
 ## Architecture: before vs after
 
@@ -41,6 +45,26 @@ flowchart LR
 ```
 
 Two independent processes. Pure-tools MCP. Pull model. Immune to #57372 by construction.
+
+You need to do:
+```
+❯ /telegram:start
+
+● plugin:telegram:telegram - start_daemon (MCP)
+  ⎿  {
+       "already_running": true,
+       "pid": 2440
+     }
+
+● plugin:telegram:telegram - daemon_status (MCP)
+  ⎿  {
+       "alive": true,
+       "pid": 2440,
+       "heartbeat_age_ms": 292.697021484375,
+       "bot_username": "your_bot",
+       "started_at": "2026-05-12T15:37:31.512Z"
+     }
+```
 
 📖 **Detailed design, diagrams, schemas, and rationale** → [`external_plugins/telegram/docs/`](external_plugins/telegram/docs/)
 
@@ -162,4 +186,4 @@ Only `external_plugins/telegram/` and top-level documentation (this `README.md`,
 
 ---
 
-This fork is unofficial and not endorsed by Anthropic. For the official plugin marketplace and unaffected plugins, see the upstream repo.
+This fork is unofficial and not endorsed by Anthropic. Also it's under dev. Any questions ask in plugin issue or my email/telegram. For the official plugin marketplace and unaffected plugins, see the upstream repo.
