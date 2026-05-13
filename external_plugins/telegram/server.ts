@@ -1278,6 +1278,16 @@ void (async () => {
             ],
             { scope: { type: 'all_private_chats' } },
           ).catch(() => {})
+          // Workaround for issue #57372: periodic re-registration ping.
+          // Emit notifications/tools/list_changed every 4 min to force the host
+          // to refresh its tool cache before any prompt-cache TTL rotation (~5 min)
+          // can drop our tools from the registry.
+          setInterval(() => {
+            if (!shuttingDown) {
+              process.stderr.write(`telegram channel: re-registration ping (issue #57372 workaround)\n`)
+              void notify({ method: 'notifications/tools/list_changed' })
+            }
+          }, 4 * 60 * 1000).unref()
         },
       })
       return // bot.stop() was called — clean exit from the loop

@@ -129,7 +129,7 @@ The host doesn't tell us why tools disappear — so make the **plugin** narrate 
 
 Each is a **plugin-side** mitigation we can ship without waiting for an upstream fix.
 
-- [ ] **A. Periodic re-registration ping**: have the plugin emit `notifications/tools/list_changed` every 4 minutes to force the host to refresh its tool list before any cache rotation can drop them.
+- [x] **A. Periodic re-registration ping**: ✅ DONE — plugin now emits `notifications/tools/list_changed` every 4 minutes (staggered just before the suspected 5-min cache-rotation TTL) to force the host to refresh its tool list. Logged as `re-registration ping (issue #57372 workaround)` for easy tracking.
 - [ ] **B. Reverse heartbeat**: plugin sends a no-op JSON-RPC notification to keep the stdio pipe warm. (Tests if the bug is connection-staleness related.)
 - [ ] **C. Watchdog re-spawn**: a small wrapper around `server.ts` that detects when the host has stopped issuing requests for >5 min and forces a clean restart.
 - [ ] **D. Document `/reload-plugins` automation**: if no programmatic workaround exists, at minimum a `/telegram-reload` slash command that wraps `/reload-plugins`.
